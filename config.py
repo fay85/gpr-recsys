@@ -60,6 +60,7 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size: int = 128
     num_workers: int = 4
+    dtype: str = "bfloat16"        # "bfloat16" or "float32"
 
     # Stage 1: MTP pre-training
     mtp_epochs: int = 30
