@@ -93,16 +93,15 @@ class HSTUAttention(nn.Module):
         scores = Q @ K.transpose(-2, -1) / math.sqrt(dk)    # [B, H, L, L]
 
         # Hybrid attention mask (Eq. 2 in GPR paper)
-        mask = self._build_hybrid_mask(token_types, L, x.device)  # [B, L, L]
+        mask = self._build_hybrid_mask(token_types, L, x.device, x.dtype)
         scores = scores + mask.unsqueeze(1)                        # broadcast over heads
 
         # Padding mask
         if seq_lens is not None:
             pad_mask = torch.arange(L, device=x.device).unsqueeze(0) >= seq_lens.unsqueeze(1)
-            # mask out columns (keys) that are padding
             scores = scores.masked_fill(
                 pad_mask.unsqueeze(1).unsqueeze(2).expand(-1, H, L, -1),
-                float("-inf"),
+                torch.finfo(scores.dtype).min,
             )
 
         attn_weights = self.dropout(F.softmax(scores, dim=-1))
@@ -113,7 +112,7 @@ class HSTUAttention(nn.Module):
         return self.W_o(out)
 
     @staticmethod
-    def _build_hybrid_mask(token_types, L, device):
+    def _build_hybrid_mask(token_types, L, device, dtype):
         """
         Build M_hybrid (Eq. 2 in GPR paper):
           M[i,j] = 0       if i >= j  OR  both X_i, X_j ∈ {U/O/E-Token}
@@ -124,9 +123,9 @@ class HSTUAttention(nn.Module):
         B = token_types.shape[0]
         is_prompt = (token_types < 3)  # [B, L]
 
-        # Start with causal mask
+        neg_inf = torch.finfo(dtype).min
         causal = torch.triu(
-            torch.full((L, L), float("-inf"), device=device), diagonal=1
+            torch.full((L, L), neg_inf, device=device, dtype=dtype), diagonal=1
         )
         mask = causal.unsqueeze(0).expand(B, -1, -1).clone()  # [B, L, L]
 
@@ -255,7 +254,7 @@ class MixtureOfRecursions(nn.Module):
         else:
             depth_probs = F.one_hot(
                 depth_logits.argmax(dim=-1), num_classes=R
-            ).float()
+            ).to(x.dtype)
 
         outputs = [x]
         current = x
@@ -373,12 +372,12 @@ class HSD(nn.Module):
         u_mask = (token_types == 0)
         if u_mask.any():
             user_emb = self.user_proj(user_features)
-            x = x + u_mask.unsqueeze(-1).float() * user_emb.unsqueeze(1)
+            x = x + u_mask.unsqueeze(-1).to(x.dtype) * user_emb.unsqueeze(1)
 
         e_mask = (token_types == 2)
         if e_mask.any():
             env_emb = self.env_proj(env_features)
-            x = x + e_mask.unsqueeze(-1).float() * env_emb.unsqueeze(1)
+            x = x + e_mask.unsqueeze(-1).to(x.dtype) * env_emb.unsqueeze(1)
 
         positions = torch.arange(L, device=x.device).unsqueeze(0).expand(B, -1)
         x = x + self.pos_embed(positions) + self.type_embed(token_types)
@@ -489,7 +488,7 @@ class RefiningModule(nn.Module):
             x_0_pred = (x_t - sqrt_1ma * noise_pred) / (sqrt_a + 1e-8)
             return x_0_pred, aux_loss
         else:
-            x = torch.randn(B, D, device=device)
+            x = torch.randn(B, D, device=device, dtype=cond.dtype)
             for step in reversed(range(self.n_steps)):
                 t = torch.full((B,), step, device=device, dtype=torch.long)
                 noise_pred = self._predict_noise(x, cond, t)
@@ -507,7 +506,7 @@ class RefiningModule(nn.Module):
                     x = mean + torch.sqrt(var) * torch.randn_like(x)
                 else:
                     x = x_0_pred
-            return x, torch.tensor(0.0, device=device)
+            return x, torch.tensor(0.0, device=device, dtype=cond.dtype)
 
 
 # =========================================================================
@@ -561,6 +560,7 @@ class PTD(nn.Module):
     def forward(self, intent_emb, target_codes=None):
         B = intent_emb.shape[0]
         device = intent_emb.device
+        _dtype = intent_emb.dtype
 
         queries = self.thinking_queries.unsqueeze(0).expand(B, -1, -1)
         thinking, _ = self.cross_attn(queries, intent_emb, intent_emb)
@@ -573,7 +573,7 @@ class PTD(nn.Module):
         context = torch.cat([thinking, refined.unsqueeze(1)], dim=1)
 
         all_logits = []
-        prev_code_emb = torch.zeros(B, 1, self.d_model, device=device)
+        prev_code_emb = torch.zeros(B, 1, self.d_model, device=device, dtype=_dtype)
 
         for lvl in range(self.n_levels):
             pos_emb = self.code_pos(
@@ -603,6 +603,7 @@ class PTD(nn.Module):
     def generate(self, intent_emb, beam_width=1):
         B = intent_emb.shape[0]
         device = intent_emb.device
+        _dtype = intent_emb.dtype
 
         queries = self.thinking_queries.unsqueeze(0).expand(B, -1, -1)
         thinking, _ = self.cross_attn(queries, intent_emb, intent_emb)
@@ -613,7 +614,7 @@ class PTD(nn.Module):
         context = torch.cat([thinking, refined.unsqueeze(1)], dim=1)
 
         codes = []
-        prev_code_emb = torch.zeros(B, 1, self.d_model, device=device)
+        prev_code_emb = torch.zeros(B, 1, self.d_model, device=device, dtype=_dtype)
         for lvl in range(self.n_levels):
             pos_emb = self.code_pos(
                 torch.full((B, 1), lvl, device=device, dtype=torch.long)
@@ -864,7 +865,7 @@ class GPR(nn.Module):
             context = torch.cat([thinking, refined.unsqueeze(1)], dim=1)
 
             codes_k, logprobs_k = [], []
-            prev = torch.zeros(B, 1, self.ptd.d_model, device=intent.device)
+            prev = torch.zeros(B, 1, self.ptd.d_model, device=intent.device, dtype=intent.dtype)
 
             for lvl in range(self.ptd.n_levels):
                 pos_emb = self.ptd.code_pos(
@@ -946,7 +947,7 @@ class GPR(nn.Module):
 
             # Each beam entry: (prefix_codes: list[int], cumulative_log_prob: float,
             #                    prev_emb: Tensor [1,1,D])
-            beams = [([], 0.0, torch.zeros(1, 1, self.ptd.d_model, device=device))]
+            beams = [([], 0.0, torch.zeros(1, 1, self.ptd.d_model, device=device, dtype=intent.dtype))]
 
             for lvl in range(n_levels):
                 new_beams = []
@@ -994,7 +995,7 @@ class GPR(nn.Module):
 
             while len(result_codes_b) < n_results:
                 result_codes_b.append(torch.zeros(n_levels, device=device, dtype=torch.long))
-                result_values_b.append(torch.tensor(0.0, device=device))
+                result_values_b.append(torch.tensor(0.0, device=device, dtype=intent.dtype))
 
             all_result_codes.append(torch.stack(result_codes_b[:n_results]))
             all_result_values.append(torch.stack(result_values_b[:n_results]))
@@ -1024,8 +1025,7 @@ def mtp_loss(result, target_ids, n_heads=4):
         for lvl in range(n_levels):
             total_ce += w_h * F.cross_entropy(logits[:, lvl, :], target_ids[:, lvl])
 
-    value_loss = torch.tensor(0.0, device=target_ids.device)
-    total = total_ce + 0.1 * result["refine_loss"] + 0.01 * value_loss
+    total = total_ce + 0.1 * result["refine_loss"]
     return total, {
         "ce_loss": total_ce.item(),
         "refine_loss": (
@@ -1047,7 +1047,7 @@ def vaft_loss(result, target_ids, target_values, target_actions):
     n_levels = target_ids.shape[1]
     device = target_ids.device
 
-    action_weights = torch.tensor([1.0, 2.0, 4.0], device=device)
+    action_weights = torch.tensor([1.0, 2.0, 4.0], device=device, dtype=target_values.dtype)
     w_action = action_weights[target_actions]
 
     v_norm = target_values / (target_values.mean() + 1e-8)

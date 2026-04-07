@@ -32,6 +32,13 @@ AMAZON_HF_DATASETS = {
     "Beauty": "jhan21/amazon-beauty-reviews-dataset",
 }
 
+# Local cache directory names (HF Arrow format) that can be placed in the
+# project root for offline use.  Created by ``datasets.load_dataset`` or by
+# manually downloading from HuggingFace.
+AMAZON_LOCAL_DIRS = {
+    "Beauty": "jhan21___amazon-beauty-reviews-dataset",
+}
+
 
 def _parse_timestamp(ts_val) -> int:
     """Convert timestamp to unix seconds.  Handles both int (ms or s) and
@@ -49,14 +56,46 @@ def _parse_timestamp(ts_val) -> int:
     return 0
 
 
+def _find_local_arrow(cat: str):
+    """Find a local Arrow file for the dataset in the project root or CWD.
+
+    Searches for the HF cache directory structure:
+        ``<local_dir>/default/<version>/<hash>/*-train.arrow``
+    Returns the path to the Arrow file, or None.
+    """
+    import glob as _glob
+    local_name = AMAZON_LOCAL_DIRS.get(cat)
+    if not local_name:
+        return None
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    search_bases = [
+        project_root,
+        os.path.join(project_root, "dataset"),
+        os.getcwd(),
+        os.path.join(os.getcwd(), "dataset"),
+    ]
+    for base in search_bases:
+        candidate = os.path.join(base, local_name)
+        if not os.path.isdir(candidate):
+            continue
+        arrows = _glob.glob(os.path.join(candidate, "**", "*-train.arrow"), recursive=True)
+        if arrows:
+            return arrows[0]
+    return None
+
+
 def load_amazon_reviews(cfg: DataConfig):
-    """Load Amazon Beauty reviews from HuggingFace, return (df, item_meta).
+    """Load Amazon Beauty reviews, preferring a local copy if present.
+
+    Lookup order:
+      1. Local Arrow directory ``<project_root>/jhan21___amazon-beauty-reviews-dataset/``
+      2. HuggingFace Hub (requires network; set ``HF_TOKEN`` for auth)
 
     Dataset: https://huggingface.co/datasets/jhan21/amazon-beauty-reviews-dataset
     Fields:  rating, title, text, asin, parent_asin, user_id, timestamp,
              helpful_vote, verified_purchase
     """
-    from datasets import load_dataset
+    from datasets import load_dataset, Dataset as HFDataset
 
     cat = cfg.amazon_category
     if cat not in AMAZON_HF_DATASETS:
@@ -65,9 +104,27 @@ def load_amazon_reviews(cfg: DataConfig):
             f"Available: {list(AMAZON_HF_DATASETS)}"
         )
 
-    hf_id = AMAZON_HF_DATASETS[cat]
-    print(f"  Loading HuggingFace dataset: {hf_id}")
-    ds = load_dataset(hf_id, split="train")
+    # --- Try local Arrow file first (works fully offline) ---
+    local_arrow = _find_local_arrow(cat)
+    if local_arrow is not None:
+        print(f"  Loading local dataset: {local_arrow}")
+        ds = HFDataset.from_file(local_arrow)
+    else:
+        # --- Fall back to HuggingFace Hub ---
+        hf_id = AMAZON_HF_DATASETS[cat]
+        token = os.environ.get("HF_TOKEN")
+        print(f"  Loading HuggingFace dataset: {hf_id}")
+        if token:
+            print("  Using HF_TOKEN for authenticated access")
+
+        # httpx (used by huggingface_hub) doesn't support SOCKS proxies.
+        for var in ("ALL_PROXY", "all_proxy"):
+            val = os.environ.get(var, "")
+            if val.startswith("socks"):
+                print(f"  Unsetting {var}={val} (httpx does not support SOCKS)")
+                os.environ.pop(var, None)
+
+        ds = load_dataset(hf_id, split="train", token=token)
 
     rows = []
     for rec in ds:
@@ -299,7 +356,8 @@ def generate_arr_samples(batch, item2sid, all_items, ratio=0.2, n_levels=3):
             synthetic["semantic_ids"][i, pos] = torch.tensor(sid, dtype=torch.long, device=device)
 
     # Time-shift environment features
-    noise = torch.randn(n_syn, synthetic["env_features"].shape[-1], device=device) * 0.1
+    noise = torch.randn(n_syn, synthetic["env_features"].shape[-1],
+                        device=device, dtype=synthetic["env_features"].dtype) * 0.1
     synthetic["env_features"] = synthetic["env_features"] + noise
 
     return synthetic

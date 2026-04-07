@@ -285,10 +285,12 @@ class RQKMeansPlus(nn.Module):
         return np.concatenate(all_codes, axis=0)
 
     def save(self, path: str):
-        torch.save(self.state_dict(), path)
+        # Always save as CPU tensors for cross-device portability (CUDA ↔ MUSA)
+        torch.save({k: v.cpu() for k, v in self.state_dict().items()}, path)
         print(f"Tokenizer saved to {path}")
 
     def load(self, path: str):
-        self.load_state_dict(torch.load(path, weights_only=True))
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        self.load_state_dict(state)
         self._fitted = True
         print(f"Tokenizer loaded from {path}")
