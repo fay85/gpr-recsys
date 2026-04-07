@@ -61,7 +61,7 @@ python train.py --dataset synthetic --batch_size 128
 python train.py --dataset amazon --batch_size 128
 ```
 
-The Amazon Beauty dataset will be downloaded automatically.
+The [Amazon Beauty Reviews](https://huggingface.co/datasets/jhan21/amazon-beauty-reviews-dataset) dataset will be downloaded automatically via HuggingFace `datasets`.
 
 ### Run individual stages
 

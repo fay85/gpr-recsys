@@ -10,8 +10,6 @@ Amazon Reviews (Beauty 5-core) maps to GPR schema:
 """
 
 import os
-import json
-import gzip
 import random
 from collections import defaultdict
 from typing import Optional
@@ -28,80 +26,62 @@ from config import DataConfig
 # Amazon Reviews download & preprocessing
 # ---------------------------------------------------------------------------
 
-AMAZON_URLS = {
-    "Beauty": (
-        "https://datarepo.eng.ucsd.edu/mcauley_group/data/amazon_v2/categoryFiles/All_Beauty.json.gz",
-        "https://datarepo.eng.ucsd.edu/mcauley_group/data/amazon_v2/metaFiles2/meta_All_Beauty.json.gz",
-    ),
+# HuggingFace dataset identifiers (the old UCSD URLs are defunct).
+# Ref: https://huggingface.co/datasets/jhan21/amazon-beauty-reviews-dataset
+AMAZON_HF_DATASETS = {
+    "Beauty": "jhan21/amazon-beauty-reviews-dataset",
 }
 
 
-def _download(url: str, path: str):
-    import requests
-    if os.path.exists(path):
-        return
-    print(f"Downloading {url} ...")
-    r = requests.get(url, stream=True)
-    r.raise_for_status()
-    with open(path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1 << 20):
-            f.write(chunk)
-    print(f"Saved to {path}")
-
-
-def _parse_gz_json(path: str):
-    with gzip.open(path, "rt", encoding="utf-8") as f:
-        for line in f:
+def _parse_timestamp(ts_val) -> int:
+    """Convert timestamp to unix seconds.  Handles both int (ms or s) and
+    ISO-8601 strings like '2020-05-05 14:08:48.923'."""
+    if isinstance(ts_val, (int, float)):
+        v = int(ts_val)
+        return v // 1000 if v > 1e12 else v
+    if isinstance(ts_val, str):
+        from datetime import datetime
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
             try:
-                yield json.loads(line.strip())
-            except json.JSONDecodeError:
+                return int(datetime.strptime(ts_val, fmt).timestamp())
+            except ValueError:
                 continue
+    return 0
 
 
 def load_amazon_reviews(cfg: DataConfig):
-    """Load Amazon Reviews, return (interactions_df, item_features dict)."""
-    os.makedirs(cfg.data_dir, exist_ok=True)
+    """Load Amazon Beauty reviews from HuggingFace, return (df, item_meta).
+
+    Dataset: https://huggingface.co/datasets/jhan21/amazon-beauty-reviews-dataset
+    Fields:  rating, title, text, asin, parent_asin, user_id, timestamp,
+             helpful_vote, verified_purchase
+    """
+    from datasets import load_dataset
 
     cat = cfg.amazon_category
-    if cat not in AMAZON_URLS:
-        raise ValueError(f"Unsupported category: {cat}. Available: {list(AMAZON_URLS)}")
+    if cat not in AMAZON_HF_DATASETS:
+        raise ValueError(
+            f"Unsupported category: {cat}. "
+            f"Available: {list(AMAZON_HF_DATASETS)}"
+        )
 
-    review_url, meta_url = AMAZON_URLS[cat]
-    review_path = os.path.join(cfg.data_dir, f"reviews_{cat}.json.gz")
-    meta_path = os.path.join(cfg.data_dir, f"meta_{cat}.json.gz")
+    hf_id = AMAZON_HF_DATASETS[cat]
+    print(f"  Loading HuggingFace dataset: {hf_id}")
+    ds = load_dataset(hf_id, split="train")
 
-    _download(review_url, review_path)
-    _download(meta_url, meta_path)
-
-    # Parse item metadata
-    item_meta = {}
-    for rec in _parse_gz_json(meta_path):
-        asin = rec.get("asin", "")
-        if not asin:
-            continue
-        cats = rec.get("category", rec.get("categories", []))
-        if isinstance(cats, list) and cats and isinstance(cats[0], list):
-            cats = cats[0]
-        price_str = rec.get("price", "0")
-        try:
-            price = float(str(price_str).replace("$", "").replace(",", "").strip() or "0")
-        except ValueError:
-            price = 0.0
-        item_meta[asin] = {
-            "title": rec.get("title", ""),
-            "categories": cats if isinstance(cats, list) else [],
-            "price": max(price, 1.0),
-        }
-
-    # Parse reviews
     rows = []
-    for rec in _parse_gz_json(review_path):
+    for rec in ds:
+        user = rec.get("user_id", "")
         asin = rec.get("asin", "")
-        user = rec.get("reviewerID", "")
-        rating = rec.get("overall", 3.0)
-        ts = rec.get("unixReviewTime", 0)
+        rating = rec.get("rating", 3.0)
+        ts = _parse_timestamp(rec.get("timestamp", 0))
         if asin and user and ts:
-            rows.append({"user": user, "item": asin, "rating": rating, "timestamp": ts})
+            rows.append({
+                "user": user,
+                "item": asin,
+                "rating": float(rating),
+                "timestamp": ts,
+            })
 
     df = pd.DataFrame(rows).sort_values(["user", "timestamp"]).reset_index(drop=True)
 
@@ -111,6 +91,16 @@ def load_amazon_reviews(cfg: DataConfig):
         df = df[df["item"].isin(item_counts[item_counts >= 5].index)]
         user_counts = df["user"].value_counts()
         df = df[df["user"].isin(user_counts[user_counts >= 5].index)]
+
+    # Build lightweight item_meta (the HF dataset has no price/category
+    # metadata, so we use defaults; value signal comes from ratings).
+    item_meta = {}
+    for asin in df["item"].unique():
+        item_meta[asin] = {
+            "title": asin,
+            "categories": [],
+            "price": 1.0,
+        }
 
     return df, item_meta
 
