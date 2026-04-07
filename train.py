@@ -63,6 +63,23 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def get_dtype(name: str) -> torch.dtype:
+    return {"bfloat16": torch.bfloat16, "float16": torch.float16,
+            "float32": torch.float32}[name]
+
+
+def to_device(batch: dict, device: str, dtype: torch.dtype) -> dict:
+    """Move batch to device, casting float tensors to the target dtype."""
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            v = v.to(device)
+            if v.is_floating_point():
+                v = v.to(dtype)
+        out[k] = v
+    return out
+
+
 # ---------------------------------------------------------------------------
 # TensorBoard helper
 # ---------------------------------------------------------------------------
@@ -103,7 +120,8 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger):
     print("=" * 60)
 
     device = cfg.train.device
-    model = model.to(device)
+    dtype = get_dtype(cfg.train.dtype)
+    model = model.to(device=device, dtype=dtype)
 
     optimizer = AdamW(
         model.parameters(),
@@ -125,8 +143,7 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger):
 
         pbar = tqdm(train_loader, desc=f"MTP Epoch {epoch+1}/{cfg.train.mtp_epochs}")
         for batch in pbar:
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                     for k, v in batch.items()}
+            batch = to_device(batch, device, dtype)
 
             result = model(batch, mode="mtp")
             loss, metrics = mtp_loss(
@@ -204,7 +221,8 @@ def train_vaft(model, train_loader, val_loader, cfg, tb: TBLogger):
     print("=" * 60)
 
     device = cfg.train.device
-    model = model.to(device)
+    dtype = get_dtype(cfg.train.dtype)
+    model = model.to(device=device, dtype=dtype)
 
     optimizer = AdamW(model.parameters(), lr=cfg.train.vaft_lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(
@@ -221,8 +239,7 @@ def train_vaft(model, train_loader, val_loader, cfg, tb: TBLogger):
 
         pbar = tqdm(train_loader, desc=f"VAFT Epoch {epoch+1}/{cfg.train.vaft_epochs}")
         for batch in pbar:
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                     for k, v in batch.items()}
+            batch = to_device(batch, device, dtype)
 
             result = model(batch, mode="vaft")
             loss, metrics = vaft_loss(
@@ -321,9 +338,9 @@ def _compute_batch_popularity(semantic_ids, token_types, action_types, n_levels)
                 continue
 
             unique_codes, counts = pos_codes.unique(return_counts=True)
-            total = counts.sum().float()
+            total = counts.sum().item()
             pop_per_level[lvl] = {
-                c.item(): (cnt / total).item()
+                c.item(): cnt.item() / total
                 for c, cnt in zip(unique_codes, counts)
             }
 
@@ -345,7 +362,7 @@ def compute_process_rewards(codes, popularity, all_codes_per_level,
     """
     B, K, n_levels = codes.shape
     device = codes.device
-    rewards = torch.zeros(B, K, n_levels, device=device)
+    rewards = torch.zeros(B, K, n_levels, device=device, dtype=terminal_rewards.dtype)
 
     for b in range(B):
         for lvl in range(n_levels):
@@ -383,7 +400,8 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
     print("=" * 60)
 
     device = cfg.train.device
-    model = model.to(device)
+    dtype = get_dtype(cfg.train.dtype)
+    model = model.to(device=device, dtype=dtype)
 
     n_levels = cfg.model.n_semantic_levels
     gamma = cfg.train.gamma
@@ -417,8 +435,7 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
 
         pbar = tqdm(train_loader, desc=f"HEPO Epoch {epoch+1}/{cfg.train.hepo_epochs}")
         for batch in pbar:
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                     for k, v in batch.items()}
+            batch = to_device(batch, device, dtype)
 
             # --- ARR: augment with synthetic anticipatory samples ---
             if cfg.train.arr_enabled and item2sid:
@@ -453,7 +470,7 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
 
             terminal_reward = (
                 -torch.abs(pred_values - target_value.unsqueeze(1))
-                + (cand_codes[:, :, -1] == target_ids[:, -1].unsqueeze(1)).float()
+                + (cand_codes[:, :, -1] == target_ids[:, -1].unsqueeze(1)).to(dtype)
             )
 
             rewards = compute_process_rewards(
@@ -501,7 +518,7 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
                     deltas.append(delta)
 
                 # GAE: A_ℓ = Σ_{l=0}^{L-ℓ-1} (γλ)^l · δ_{ℓ+l}
-                gae = torch.zeros(B, device=device)
+                gae = torch.zeros(B, device=device, dtype=dtype)
                 for lvl in reversed(range(n_levels - 1)):
                     gae = deltas[lvl] + gamma * lam * gae
                     advantages[:, k_idx, lvl] = gae
@@ -543,7 +560,7 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
 
             # --- Per-level value loss (Eq. 10) ---
             # L_ϕ = E[ Σ_ℓ (V_ϕ(s, z_{1:ℓ-1}) - G_ℓ)² ]
-            value_loss = torch.tensor(0.0, device=device)
+            value_loss = torch.tensor(0.0, device=device, dtype=dtype)
             for k_idx in range(K):
                 codes_k = cand_codes[:, k_idx, :]
                 for lvl in range(n_levels):
@@ -627,6 +644,7 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
 @torch.no_grad()
 def evaluate_model(model, val_loader, cfg, mode="mtp"):
     device = cfg.train.device
+    dtype = get_dtype(cfg.train.dtype)
     model.eval()
 
     total_loss = 0.0
@@ -635,8 +653,7 @@ def evaluate_model(model, val_loader, cfg, mode="mtp"):
     total_samples = 0
 
     for batch in val_loader:
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                 for k, v in batch.items()}
+        batch = to_device(batch, device, dtype)
 
         result = model(batch, mode="mtp")
 
@@ -791,7 +808,13 @@ def main():
                         help="TensorBoard log directory")
     parser.add_argument("--run_name", type=str, default=None,
                         help="Custom run name for TensorBoard")
+    parser.add_argument("--hf_token", type=str, default=None,
+                        help="HuggingFace token for authenticated dataset downloads")
     args = parser.parse_args()
+
+    # Propagate HF token to environment so data_utils picks it up
+    if args.hf_token:
+        os.environ["HF_TOKEN"] = args.hf_token
 
     # --- Config ---
     cfg = GPRConfig()
@@ -812,7 +835,7 @@ def main():
 
     # --- TensorBoard setup ---
     run_name = args.run_name or (
-        f"gpr_{args.dataset}_{args.stage}_"
+        f"gpr_cuda_{args.dataset}_{args.stage}_"
         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
     tb_log_dir = os.path.join(args.log_dir, run_name)
@@ -843,6 +866,7 @@ def main():
         }, f, indent=2)
 
     print(f"Device: {cfg.train.device}")
+    print(f"Dtype: {cfg.train.dtype}")
     print(f"Dataset: {cfg.data.dataset}")
     print(f"TensorBoard: {tb_log_dir}")
     print(f"  -> Launch:  tensorboard --logdir {args.log_dir} --port 6006")
