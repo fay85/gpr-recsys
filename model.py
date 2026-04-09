@@ -768,7 +768,11 @@ class GPR(nn.Module):
             for _ in range(cfg.n_mtp_heads)
         ])
 
-    def forward(self, batch, mode="mtp"):
+    def forward(self, batch, mode="mtp", **kwargs):
+        # Modes that handle their own HSD call (return early)
+        if mode == "hepo_candidates":
+            return self._forward_hepo_candidates(batch, **kwargs)
+
         semantic_ids = batch["semantic_ids"]
         token_types = batch["token_types"]
         user_features = batch["user_features"]
@@ -788,6 +792,8 @@ class GPR(nn.Module):
             return self._forward_vaft(intent, intent_summary, target_ids, batch)
         elif mode == "hepo_generate":
             return self._forward_generate(intent, intent_summary)
+        elif mode == "hepo_train":
+            return self._forward_hepo_train(batch, intent, intent_summary)
         else:
             return self._forward_mtp(intent, intent_summary, target_ids)
 
@@ -829,6 +835,50 @@ class GPR(nn.Module):
         # stopgrad(h) for value function (Sec. 3.3)
         level_values, final_value = self.hte(intent_summary.detach(), codes)
         return {"codes": codes, "level_values": level_values, "final_value": final_value}
+
+    def _forward_hepo_candidates(self, batch, n_candidates=20):
+        """Generate K candidates via forward() so FSDP gathers params."""
+        with torch.no_grad():
+            return self.generate_candidates(batch, n_candidates=n_candidates)
+
+    def _forward_hepo_train(self, batch, intent, intent_summary):
+        """Compute new log-probs and HTE values for HEPO loss.
+
+        Expects batch to contain 'cand_codes' [B, K, n_levels] from
+        a prior hepo_candidates call.  Returns new_logprobs (with grad
+        through HSD/PTD) and value_preds (with grad through HTE).
+        """
+        cand_codes = batch["cand_codes"]
+        B, K, n_levels = cand_codes.shape
+        device = cand_codes.device
+
+        intent_summary_det = intent_summary.detach()
+
+        all_new_logprobs = []
+        for k_idx in range(K):
+            codes_k = cand_codes[:, k_idx, :]
+            projected = self.mtp_projections[k_idx % self.n_mtp_heads](intent)
+            logits, _ = self.ptd(projected, codes_k)
+            log_probs = F.log_softmax(logits, dim=-1)
+            selected = log_probs.gather(2, codes_k.unsqueeze(-1)).squeeze(-1)
+            all_new_logprobs.append(selected)
+        new_logprobs = torch.stack(all_new_logprobs, dim=1)
+
+        value_preds = torch.zeros(
+            B, K, n_levels, device=device, dtype=intent.dtype,
+        )
+        for k_idx in range(K):
+            codes_k = cand_codes[:, k_idx, :]
+            for lvl in range(n_levels):
+                partial = codes_k.clone()
+                partial[:, lvl:] = 0
+                _, fv = self.hte(intent_summary_det, partial)
+                value_preds[:, k_idx, lvl] = fv.squeeze(-1)
+
+        return {
+            "new_logprobs": new_logprobs,
+            "value_preds": value_preds,
+        }
 
     # -----------------------------------------------------------------
     # Candidate generation (sampling-based, used when no trie)

@@ -613,14 +613,12 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
                 )
                 batch = merge_batches(batch, arr_batch)
 
+            # Step 1: Generate candidates (no grad, routed through FSDP)
             model.eval()
-            with torch.no_grad():
-                gen_result = model(batch, mode="hepo_generate")
-                gen_result_full = model.module.generate_candidates(
-                    batch, n_candidates=cfg.train.n_candidates
-                ) if is_fsdp else model.generate_candidates(
-                    batch, n_candidates=cfg.train.n_candidates
-                )
+            gen_result_full = model(
+                batch, mode="hepo_candidates",
+                n_candidates=cfg.train.n_candidates,
+            )
             model.train()
 
             cand_codes = gen_result_full["codes"]
@@ -653,32 +651,23 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
                 else:
                     returns[:, :, lvl] = rewards[:, :, lvl] + gamma * returns[:, :, lvl + 1]
 
-            _model = model.module if is_fsdp else model
-            intent = _model.hsd(
-                batch["semantic_ids"], batch["token_types"],
-                batch["user_features"], batch["env_features"],
-                batch["seq_len"],
-            )
-            intent_summary = intent.mean(dim=1).detach()
+            # Step 2: Compute new log-probs + HTE values (with grad, through FSDP)
+            hepo_batch = {**batch, "cand_codes": cand_codes}
+            hepo_result = model(hepo_batch, mode="hepo_train")
 
+            new_logprobs = hepo_result["new_logprobs"]
+            value_preds = hepo_result["value_preds"]
+
+            # Compute advantages from detached HTE values
+            values_det = value_preds.detach()
             advantages = torch.zeros_like(rewards)
             for k_idx in range(K):
-                codes_k = cand_codes[:, k_idx, :]
-
-                values_at_levels = []
-                for lvl in range(n_levels):
-                    partial_codes = codes_k.clone()
-                    partial_codes[:, lvl:] = 0
-                    _, fv = _model.hte(intent_summary, partial_codes)
-                    values_at_levels.append(fv.squeeze(-1))
-                values_at_levels = torch.stack(values_at_levels, dim=1)
-
                 deltas = []
                 for lvl in range(n_levels - 1):
                     delta = (
                         rewards[:, k_idx, lvl]
-                        + gamma * values_at_levels[:, lvl + 1]
-                        - values_at_levels[:, lvl]
+                        + gamma * values_det[:, k_idx, lvl + 1]
+                        - values_det[:, k_idx, lvl]
                     )
                     deltas.append(delta)
 
@@ -694,16 +683,7 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
             sigma = final_adv.std(dim=1, keepdim=True) + 1e-8
             advantages[:, :, -1] = (final_adv - mu) / sigma
 
-            all_new_logprobs = []
-            for k_idx in range(K):
-                codes_k = cand_codes[:, k_idx, :]
-                projected = _model.mtp_projections[k_idx % _model.n_mtp_heads](intent)
-                logits, _ = _model.ptd(projected, codes_k)
-                log_probs = F.log_softmax(logits, dim=-1)
-                selected = log_probs.gather(2, codes_k.unsqueeze(-1)).squeeze(-1)
-                all_new_logprobs.append(selected)
-            new_logprobs = torch.stack(all_new_logprobs, dim=1)
-
+            # PPO-clip policy loss
             ratio = torch.exp(new_logprobs - old_logprobs.detach())
             eps = cfg.train.clip_eps
             clipped = torch.clamp(ratio, 1 - eps, 1 + eps)
@@ -718,17 +698,8 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
                 ).mean()
                 policy_loss = policy_loss + c_l * lvl_loss
 
-            value_loss = torch.tensor(0.0, device=device, dtype=dtype)
-            for k_idx in range(K):
-                codes_k = cand_codes[:, k_idx, :]
-                for lvl in range(n_levels):
-                    partial_codes = codes_k.clone()
-                    partial_codes[:, lvl:] = 0
-                    _, fv = _model.hte(intent_summary, partial_codes)
-                    value_loss = value_loss + F.mse_loss(
-                        fv.squeeze(-1), returns[:, k_idx, lvl].detach()
-                    )
-            value_loss = value_loss / (K * n_levels)
+            # Value loss (grad flows through HTE via value_preds)
+            value_loss = F.mse_loss(value_preds, returns.detach())
 
             total_loss = policy_loss + 0.5 * value_loss
 
