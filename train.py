@@ -1,43 +1,49 @@
 """
-GPR Training Pipeline with TensorBoard Monitoring.
+GPR Training Pipeline with FSDP + TensorBoard Monitoring.
 
 Three-stage training:
   Stage 1: Pre-training with Multi-Token Prediction (MTP)
   Stage 2: Value-Aware Fine-Tuning (VAFT)
   Stage 3: Post-training with HEPO (Hierarchical Enhanced Policy Optimization)
 
+Launch with torchrun for multi-GPU FSDP:
+  torchrun --nproc_per_node=8 train.py --dataset amazon
+
+Single-GPU fallback (no FSDP):
+  python train.py --dataset amazon --no_fsdp
+
 All losses, metrics, and learning rates are logged to TensorBoard.
-
-Usage:
-  # Full pipeline with synthetic data (auto-generated, no download)
-  python train.py --dataset synthetic
-
-  # Full pipeline with Amazon Reviews (auto-downloaded)
-  python train.py --dataset amazon
-
-  # Single stage
-  python train.py --stage mtp
-  python train.py --stage vaft --resume checkpoints/mtp_best.pt
-  python train.py --stage hepo --resume checkpoints/vaft_best.pt
-
-  # Launch TensorBoard (in another terminal)
-  tensorboard --logdir runs/ --port 6006
 """
 
 import os
 import argparse
+import functools
 import random
 import time
 import json
-from collections import defaultdict
 from datetime import datetime
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    ShardingStrategy,
+    CPUOffload,
+)
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy,
+    transformer_auto_wrap_policy,
+)
+from torch.distributed.fsdp.api import FullStateDictConfig, StateDictType
 from tqdm import tqdm
 
 from config import GPRConfig
@@ -52,8 +58,135 @@ from data_utils import (
     merge_batches,
 )
 from rq_tokenizer import RQKMeansPlus
-from model import GPR, SemanticTrie, mtp_loss, vaft_loss
+from model import GPR, SemanticTrie, mtp_loss, vaft_loss, HSDBlock
 
+
+# ---------------------------------------------------------------------------
+# Distributed helpers
+# ---------------------------------------------------------------------------
+
+def is_dist():
+    return dist.is_initialized()
+
+
+def rank():
+    return dist.get_rank() if is_dist() else 0
+
+
+def world_size():
+    return dist.get_world_size() if is_dist() else 1
+
+
+def is_main():
+    return rank() == 0
+
+
+def local_rank():
+    return int(os.environ.get("LOCAL_RANK", 0))
+
+
+def print0(*args, **kwargs):
+    if is_main():
+        print(*args, **kwargs)
+
+
+def setup_distributed():
+    if "RANK" not in os.environ:
+        return False
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(local_rank())
+    return True
+
+
+def cleanup_distributed():
+    if is_dist():
+        dist.destroy_process_group()
+
+
+# ---------------------------------------------------------------------------
+# FSDP wrapping
+# ---------------------------------------------------------------------------
+
+def wrap_model_fsdp(model, cfg):
+    """Wrap GPR model with FSDP using per-HSDBlock sharding."""
+    device_id = local_rank()
+    bf16_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
+    )
+
+    wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={
+            HSDBlock,
+            nn.TransformerDecoderLayer,
+        },
+    )
+
+    model = FSDP(
+        model,
+        auto_wrap_policy=wrap_policy,
+        mixed_precision=bf16_policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        device_id=device_id,
+        limit_all_gathers=True,
+        use_orig_params=True,
+    )
+
+    if cfg.train.activation_checkpointing:
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            apply_activation_checkpointing,
+            checkpoint_wrapper,
+            CheckpointImpl,
+        )
+        non_reentrant_wrapper = functools.partial(
+            checkpoint_wrapper,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        )
+        apply_activation_checkpointing(
+            model,
+            checkpoint_wrapper_fn=non_reentrant_wrapper,
+            check_fn=lambda m: isinstance(m, (HSDBlock,)),
+        )
+
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers for FSDP
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(model, path, is_fsdp=False):
+    if is_fsdp:
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+            state = model.state_dict()
+        if is_main():
+            torch.save(state, path)
+    else:
+        torch.save(model.state_dict(), path)
+
+
+def load_checkpoint(model, path, is_fsdp=False):
+    if is_fsdp:
+        full_sd = None
+        if is_main():
+            full_sd = torch.load(path, weights_only=True, map_location="cpu")
+        if is_dist():
+            objects = [full_sd]
+            dist.broadcast_object_list(objects, src=0)
+            full_sd = objects[0]
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+            model.load_state_dict(full_sd)
+    else:
+        model.load_state_dict(torch.load(path, weights_only=True))
+
+
+# ---------------------------------------------------------------------------
+# Common helpers
+# ---------------------------------------------------------------------------
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -68,8 +201,7 @@ def get_dtype(name: str) -> torch.dtype:
             "float32": torch.float32}[name]
 
 
-def to_device(batch: dict, device: str, dtype: torch.dtype) -> dict:
-    """Move batch to device, casting float tensors to the target dtype."""
+def to_device(batch: dict, device, dtype: torch.dtype) -> dict:
     out = {}
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
@@ -80,23 +212,31 @@ def to_device(batch: dict, device: str, dtype: torch.dtype) -> dict:
     return out
 
 
+def clip_grad_norm(model, max_norm, is_fsdp=False):
+    if is_fsdp:
+        return model.clip_grad_norm_(max_norm)
+    return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+
+
 # ---------------------------------------------------------------------------
-# TensorBoard helper
+# TensorBoard helper (rank-0 only)
 # ---------------------------------------------------------------------------
 
 class TBLogger:
-    """Wraps TensorBoard SummaryWriter with step tracking."""
-
     def __init__(self, log_dir: str):
-        self.writer = SummaryWriter(log_dir)
+        self.writer = SummaryWriter(log_dir) if is_main() else None
         self.global_step = 0
 
     def log_scalars(self, tag_prefix: str, scalars: dict, step: int = None):
+        if self.writer is None:
+            return
         s = step if step is not None else self.global_step
         for k, v in scalars.items():
             self.writer.add_scalar(f"{tag_prefix}/{k}", v, s)
 
     def log_scalar(self, tag: str, value: float, step: int = None):
+        if self.writer is None:
+            return
         s = step if step is not None else self.global_step
         self.writer.add_scalar(tag, value, s)
 
@@ -104,24 +244,29 @@ class TBLogger:
         self.global_step += 1
 
     def flush(self):
-        self.writer.flush()
+        if self.writer:
+            self.writer.flush()
 
     def close(self):
-        self.writer.close()
+        if self.writer:
+            self.writer.close()
 
 
 # ---------------------------------------------------------------------------
 # Stage 1: Pre-training with Multi-Token Prediction
 # ---------------------------------------------------------------------------
 
-def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger):
-    print("\n" + "=" * 60)
-    print("Stage 1: Pre-training with Multi-Token Prediction (MTP)")
-    print("=" * 60)
+def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger,
+              is_fsdp=False):
+    print0("\n" + "=" * 60)
+    print0("Stage 1: Pre-training with Multi-Token Prediction (MTP)")
+    print0("=" * 60)
 
-    device = cfg.train.device
+    device = torch.device("cuda", local_rank())
     dtype = get_dtype(cfg.train.dtype)
-    model = model.to(device=device, dtype=dtype)
+
+    if not is_fsdp:
+        model = model.to(device=device, dtype=dtype)
 
     optimizer = AdamW(
         model.parameters(),
@@ -137,11 +282,20 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger):
 
     for epoch in range(cfg.train.mtp_epochs):
         model.train()
+        if hasattr(train_loader, "sampler") and isinstance(
+            train_loader.sampler, DistributedSampler
+        ):
+            train_loader.sampler.set_epoch(epoch)
+
         epoch_loss = 0.0
         epoch_metrics = {"ce_loss": 0.0, "refine_loss": 0.0}
         n_batches = 0
 
-        pbar = tqdm(train_loader, desc=f"MTP Epoch {epoch+1}/{cfg.train.mtp_epochs}")
+        pbar = tqdm(
+            train_loader,
+            desc=f"MTP Epoch {epoch+1}/{cfg.train.mtp_epochs}",
+            disable=not is_main(),
+        )
         for batch in pbar:
             batch = to_device(batch, device, dtype)
 
@@ -152,7 +306,7 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger):
 
             optimizer.zero_grad()
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = clip_grad_norm(model, 1.0, is_fsdp)
             optimizer.step()
 
             epoch_loss += loss.item()
@@ -164,19 +318,22 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger):
                 "total_loss": loss.item(),
                 "ce_loss": metrics["ce_loss"],
                 "refine_loss": metrics["refine_loss"],
-                "grad_norm": grad_norm.item(),
+                "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
                 "lr": optimizer.param_groups[0]["lr"],
             })
             tb.step()
 
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            if is_main():
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         scheduler.step()
 
         avg_loss = epoch_loss / max(n_batches, 1)
         avg_metrics = {k: v / max(n_batches, 1) for k, v in epoch_metrics.items()}
 
-        val_loss, val_metrics = evaluate_model(model, val_loader, cfg, mode="mtp")
+        val_loss, val_metrics = evaluate_model(
+            model, val_loader, cfg, mode="mtp", is_fsdp=is_fsdp
+        )
 
         tb.log_scalars("mtp_train_epoch", {
             "avg_loss": avg_loss,
@@ -190,12 +347,12 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger):
         tb.log_scalar("lr/mtp", optimizer.param_groups[0]["lr"], step=epoch)
         tb.flush()
 
-        print(
+        print0(
             f"  Train Loss: {avg_loss:.4f} | "
             f"CE: {avg_metrics['ce_loss']:.4f} | "
             f"Refine: {avg_metrics['refine_loss']:.4f}"
         )
-        print(
+        print0(
             f"  Val Loss:   {val_loss:.4f} | "
             f"HitRate@L1: {val_metrics['hitrate_l1']:.4f} | "
             f"HitRate@Full: {val_metrics['hitrate_full']:.4f}"
@@ -203,11 +360,14 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger):
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(),
-                       os.path.join(cfg.train.save_dir, "mtp_best.pt"))
-            print("  -> Saved best MTP model")
+            save_checkpoint(
+                model,
+                os.path.join(cfg.train.save_dir, "mtp_best.pt"),
+                is_fsdp=is_fsdp,
+            )
+            print0("  -> Saved best MTP model")
 
-    print(f"MTP training complete. Best val loss: {best_val_loss:.4f}")
+    print0(f"MTP training complete. Best val loss: {best_val_loss:.4f}")
     return model
 
 
@@ -215,14 +375,17 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger):
 # Stage 2: Value-Aware Fine-Tuning (VAFT)
 # ---------------------------------------------------------------------------
 
-def train_vaft(model, train_loader, val_loader, cfg, tb: TBLogger):
-    print("\n" + "=" * 60)
-    print("Stage 2: Value-Aware Fine-Tuning (VAFT)")
-    print("=" * 60)
+def train_vaft(model, train_loader, val_loader, cfg, tb: TBLogger,
+               is_fsdp=False):
+    print0("\n" + "=" * 60)
+    print0("Stage 2: Value-Aware Fine-Tuning (VAFT)")
+    print0("=" * 60)
 
-    device = cfg.train.device
+    device = torch.device("cuda", local_rank())
     dtype = get_dtype(cfg.train.dtype)
-    model = model.to(device=device, dtype=dtype)
+
+    if not is_fsdp:
+        model = model.to(device=device, dtype=dtype)
 
     optimizer = AdamW(model.parameters(), lr=cfg.train.vaft_lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(
@@ -233,11 +396,20 @@ def train_vaft(model, train_loader, val_loader, cfg, tb: TBLogger):
 
     for epoch in range(cfg.train.vaft_epochs):
         model.train()
+        if hasattr(train_loader, "sampler") and isinstance(
+            train_loader.sampler, DistributedSampler
+        ):
+            train_loader.sampler.set_epoch(epoch)
+
         epoch_loss = 0.0
         epoch_metrics = {"ce_loss": 0.0, "value_loss": 0.0}
         n_batches = 0
 
-        pbar = tqdm(train_loader, desc=f"VAFT Epoch {epoch+1}/{cfg.train.vaft_epochs}")
+        pbar = tqdm(
+            train_loader,
+            desc=f"VAFT Epoch {epoch+1}/{cfg.train.vaft_epochs}",
+            disable=not is_main(),
+        )
         for batch in pbar:
             batch = to_device(batch, device, dtype)
 
@@ -249,7 +421,7 @@ def train_vaft(model, train_loader, val_loader, cfg, tb: TBLogger):
 
             optimizer.zero_grad()
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = clip_grad_norm(model, 1.0, is_fsdp)
             optimizer.step()
 
             epoch_loss += loss.item()
@@ -261,19 +433,22 @@ def train_vaft(model, train_loader, val_loader, cfg, tb: TBLogger):
                 "total_loss": loss.item(),
                 "ce_loss": metrics["ce_loss"],
                 "value_loss": metrics["value_loss"],
-                "grad_norm": grad_norm.item(),
+                "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
                 "lr": optimizer.param_groups[0]["lr"],
             })
             tb.step()
 
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            if is_main():
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         scheduler.step()
 
         avg_loss = epoch_loss / max(n_batches, 1)
         avg_metrics = {k: v / max(n_batches, 1) for k, v in epoch_metrics.items()}
 
-        val_loss, val_metrics = evaluate_model(model, val_loader, cfg, mode="vaft")
+        val_loss, val_metrics = evaluate_model(
+            model, val_loader, cfg, mode="vaft", is_fsdp=is_fsdp
+        )
 
         tb.log_scalars("vaft_train_epoch", {
             "avg_loss": avg_loss,
@@ -287,12 +462,12 @@ def train_vaft(model, train_loader, val_loader, cfg, tb: TBLogger):
         tb.log_scalar("lr/vaft", optimizer.param_groups[0]["lr"], step=epoch)
         tb.flush()
 
-        print(
+        print0(
             f"  Train Loss: {avg_loss:.4f} | "
             f"CE: {avg_metrics['ce_loss']:.4f} | "
             f"Value: {avg_metrics['value_loss']:.4f}"
         )
-        print(
+        print0(
             f"  Val Loss:   {val_loss:.4f} | "
             f"HitRate@L1: {val_metrics['hitrate_l1']:.4f} | "
             f"HitRate@Full: {val_metrics['hitrate_full']:.4f}"
@@ -300,11 +475,14 @@ def train_vaft(model, train_loader, val_loader, cfg, tb: TBLogger):
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(),
-                       os.path.join(cfg.train.save_dir, "vaft_best.pt"))
-            print("  -> Saved best VAFT model")
+            save_checkpoint(
+                model,
+                os.path.join(cfg.train.save_dir, "vaft_best.pt"),
+                is_fsdp=is_fsdp,
+            )
+            print0("  -> Saved best VAFT model")
 
-    print(f"VAFT training complete. Best val loss: {best_val_loss:.4f}")
+    print0(f"VAFT training complete. Best val loss: {best_val_loss:.4f}")
     return model
 
 
@@ -313,10 +491,6 @@ def train_vaft(model, train_loader, val_loader, cfg, tb: TBLogger):
 # ---------------------------------------------------------------------------
 
 def _compute_batch_popularity(semantic_ids, token_types, action_types, n_levels):
-    """
-    On-the-fly per-sample code popularity from positive I-token interactions
-    within the current batch (Eq. 6).
-    """
     B = semantic_ids.shape[0]
     popularity = []
 
@@ -351,15 +525,6 @@ def _compute_batch_popularity(semantic_ids, token_types, action_types, n_levels)
 
 def compute_process_rewards(codes, popularity, all_codes_per_level,
                             terminal_rewards, alpha=0.1):
-    """
-    Popularity-based hierarchical process rewards (Eq. 6–7).
-
-    For ℓ < L:
-        Δ_ℓ = P_ℓ(z_ℓ) − avg P_ℓ(t)  for t ∈ S_ℓ
-        r_ℓ = α_ℓ · max(0, Δ_ℓ)
-    For ℓ = L:
-        r_L = R  (terminal reward from simulator)
-    """
     B, K, n_levels = codes.shape
     device = codes.device
     rewards = torch.zeros(B, K, n_levels, device=device, dtype=terminal_rewards.dtype)
@@ -386,40 +551,34 @@ def compute_process_rewards(codes, popularity, all_codes_per_level,
 
 
 def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
-               extra_data=None):
-    """
-    HEPO training with:
-      - Popularity-based process rewards  (Eq. 6–7)
-      - Full GAE with λ                   (Eq. 8)
-      - Per-level coefficients c_ℓ        (Eq. 9)
-      - Per-level value loss              (Eq. 10)
-      - Anticipatory Request Rehearsal     (Sec. 3.3)
-    """
-    print("\n" + "=" * 60)
-    print("Stage 3: Post-training with HEPO")
-    print("=" * 60)
+               extra_data=None, is_fsdp=False):
+    print0("\n" + "=" * 60)
+    print0("Stage 3: Post-training with HEPO")
+    print0("=" * 60)
 
-    device = cfg.train.device
+    device = torch.device("cuda", local_rank())
     dtype = get_dtype(cfg.train.dtype)
-    model = model.to(device=device, dtype=dtype)
+
+    if not is_fsdp:
+        model = model.to(device=device, dtype=dtype)
 
     n_levels = cfg.model.n_semantic_levels
     gamma = cfg.train.gamma
     lam = cfg.train.lam
 
-    # Per-level coefficients c_ℓ (Eq. 9): increasing weight for finer levels
     level_coeffs = [(lvl + 1) / n_levels for lvl in range(n_levels)]
 
     all_codes_per_level = extra_data.get("all_codes_per_level", {}) if extra_data else {}
     item2sid = extra_data.get("item2sid", {}) if extra_data else {}
     all_items = extra_data.get("all_items", []) if extra_data else []
 
-    policy_params = (
-        list(model.hsd.parameters())
-        + list(model.ptd.parameters())
-        + list(model.mtp_projections.parameters())
-    )
-    value_params = list(model.hte.parameters())
+    policy_params = []
+    value_params = []
+    for name, param in model.named_parameters():
+        if "hte" in name:
+            value_params.append(param)
+        else:
+            policy_params.append(param)
 
     policy_optimizer = AdamW(policy_params, lr=cfg.train.hepo_lr_policy)
     value_optimizer = AdamW(value_params, lr=cfg.train.hepo_lr_value)
@@ -428,16 +587,24 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
 
     for epoch in range(cfg.train.hepo_epochs):
         model.train()
+        if hasattr(train_loader, "sampler") and isinstance(
+            train_loader.sampler, DistributedSampler
+        ):
+            train_loader.sampler.set_epoch(epoch)
+
         epoch_policy_loss = 0.0
         epoch_value_loss = 0.0
         epoch_avg_reward = 0.0
         n_batches = 0
 
-        pbar = tqdm(train_loader, desc=f"HEPO Epoch {epoch+1}/{cfg.train.hepo_epochs}")
+        pbar = tqdm(
+            train_loader,
+            desc=f"HEPO Epoch {epoch+1}/{cfg.train.hepo_epochs}",
+            disable=not is_main(),
+        )
         for batch in pbar:
             batch = to_device(batch, device, dtype)
 
-            # --- ARR: augment with synthetic anticipatory samples ---
             if cfg.train.arr_enabled and item2sid:
                 arr_batch = generate_arr_samples(
                     batch, item2sid, all_items,
@@ -446,23 +613,24 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
                 )
                 batch = merge_batches(batch, arr_batch)
 
-            # --- Simulation: generate K candidates ---
             model.eval()
             with torch.no_grad():
-                gen_result = model.generate_candidates(
+                gen_result = model(batch, mode="hepo_generate")
+                gen_result_full = model.module.generate_candidates(
+                    batch, n_candidates=cfg.train.n_candidates
+                ) if is_fsdp else model.generate_candidates(
                     batch, n_candidates=cfg.train.n_candidates
                 )
             model.train()
 
-            cand_codes = gen_result["codes"]
-            old_logprobs = gen_result["logprobs"]
-            pred_values = gen_result["values"]
+            cand_codes = gen_result_full["codes"]
+            old_logprobs = gen_result_full["logprobs"]
+            pred_values = gen_result_full["values"]
 
             B, K, _ = cand_codes.shape
             target_ids = batch["target_ids"]
             target_value = batch["target_value"]
 
-            # --- Popularity-based process rewards (Eq. 6–7) ---
             popularity = _compute_batch_popularity(
                 batch["semantic_ids"], batch["token_types"],
                 batch["action_types"], n_levels,
@@ -478,7 +646,6 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
                 terminal_reward, alpha=cfg.train.hepo_alpha,
             )
 
-            # --- Compute per-level cumulative returns G_ℓ (Eq. 10) ---
             returns = torch.zeros_like(rewards)
             for lvl in reversed(range(n_levels)):
                 if lvl == n_levels - 1:
@@ -486,8 +653,8 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
                 else:
                     returns[:, :, lvl] = rewards[:, :, lvl] + gamma * returns[:, :, lvl + 1]
 
-            # --- Compute advantages with GAE-λ (Eq. 8) ---
-            intent = model.hsd(
+            _model = model.module if is_fsdp else model
+            intent = _model.hsd(
                 batch["semantic_ids"], batch["token_types"],
                 batch["user_features"], batch["env_features"],
                 batch["seq_len"],
@@ -498,16 +665,14 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
             for k_idx in range(K):
                 codes_k = cand_codes[:, k_idx, :]
 
-                # V_ϕ(s, z_{1:ℓ-1}) at each level using partial codes
                 values_at_levels = []
                 for lvl in range(n_levels):
                     partial_codes = codes_k.clone()
                     partial_codes[:, lvl:] = 0
-                    _, fv = model.hte(intent_summary, partial_codes)
+                    _, fv = _model.hte(intent_summary, partial_codes)
                     values_at_levels.append(fv.squeeze(-1))
-                values_at_levels = torch.stack(values_at_levels, dim=1)  # [B, L]
+                values_at_levels = torch.stack(values_at_levels, dim=1)
 
-                # TD errors for intermediate levels
                 deltas = []
                 for lvl in range(n_levels - 1):
                     delta = (
@@ -517,33 +682,28 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
                     )
                     deltas.append(delta)
 
-                # GAE: A_ℓ = Σ_{l=0}^{L-ℓ-1} (γλ)^l · δ_{ℓ+l}
                 gae = torch.zeros(B, device=device, dtype=dtype)
                 for lvl in reversed(range(n_levels - 1)):
                     gae = deltas[lvl] + gamma * lam * gae
                     advantages[:, k_idx, lvl] = gae
 
-                # Final level: z-score across candidates (set below)
                 advantages[:, k_idx, -1] = rewards[:, k_idx, -1]
 
-            # Z-score normalize final level across K candidates (Eq. 8)
             final_adv = advantages[:, :, -1]
             mu = final_adv.mean(dim=1, keepdim=True)
             sigma = final_adv.std(dim=1, keepdim=True) + 1e-8
             advantages[:, :, -1] = (final_adv - mu) / sigma
 
-            # --- Compute current log-probs ---
             all_new_logprobs = []
             for k_idx in range(K):
                 codes_k = cand_codes[:, k_idx, :]
-                projected = model.mtp_projections[k_idx % model.n_mtp_heads](intent)
-                logits, _ = model.ptd(projected, codes_k)
+                projected = _model.mtp_projections[k_idx % _model.n_mtp_heads](intent)
+                logits, _ = _model.ptd(projected, codes_k)
                 log_probs = F.log_softmax(logits, dim=-1)
                 selected = log_probs.gather(2, codes_k.unsqueeze(-1)).squeeze(-1)
                 all_new_logprobs.append(selected)
-            new_logprobs = torch.stack(all_new_logprobs, dim=1)  # [B, K, L]
+            new_logprobs = torch.stack(all_new_logprobs, dim=1)
 
-            # --- PPO-clip policy loss with per-level c_ℓ (Eq. 9) ---
             ratio = torch.exp(new_logprobs - old_logprobs.detach())
             eps = cfg.train.clip_eps
             clipped = torch.clamp(ratio, 1 - eps, 1 + eps)
@@ -558,15 +718,13 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
                 ).mean()
                 policy_loss = policy_loss + c_l * lvl_loss
 
-            # --- Per-level value loss (Eq. 10) ---
-            # L_ϕ = E[ Σ_ℓ (V_ϕ(s, z_{1:ℓ-1}) - G_ℓ)² ]
             value_loss = torch.tensor(0.0, device=device, dtype=dtype)
             for k_idx in range(K):
                 codes_k = cand_codes[:, k_idx, :]
                 for lvl in range(n_levels):
                     partial_codes = codes_k.clone()
                     partial_codes[:, lvl:] = 0
-                    _, fv = model.hte(intent_summary, partial_codes)
+                    _, fv = _model.hte(intent_summary, partial_codes)
                     value_loss = value_loss + F.mse_loss(
                         fv.squeeze(-1), returns[:, k_idx, lvl].detach()
                     )
@@ -577,7 +735,7 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
             policy_optimizer.zero_grad()
             value_optimizer.zero_grad()
             total_loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = clip_grad_norm(model, 1.0, is_fsdp)
             policy_optimizer.step()
             value_optimizer.step()
 
@@ -593,21 +751,24 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
                 "total_loss": total_loss.item(),
                 "avg_reward": avg_reward,
                 "avg_ratio": ratio.mean().item(),
-                "grad_norm": grad_norm.item(),
+                "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
             })
             tb.step()
 
-            pbar.set_postfix(
-                policy=f"{policy_loss.item():.4f}",
-                value=f"{value_loss.item():.4f}",
-                reward=f"{avg_reward:.4f}",
-            )
+            if is_main():
+                pbar.set_postfix(
+                    policy=f"{policy_loss.item():.4f}",
+                    value=f"{value_loss.item():.4f}",
+                    reward=f"{avg_reward:.4f}",
+                )
 
         avg_pl = epoch_policy_loss / max(n_batches, 1)
         avg_vl = epoch_value_loss / max(n_batches, 1)
         avg_rw = epoch_avg_reward / max(n_batches, 1)
 
-        val_loss, val_metrics = evaluate_model(model, val_loader, cfg, mode="mtp")
+        val_loss, val_metrics = evaluate_model(
+            model, val_loader, cfg, mode="mtp", is_fsdp=is_fsdp
+        )
 
         tb.log_scalars("hepo_train_epoch", {
             "avg_policy_loss": avg_pl,
@@ -621,7 +782,7 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
         }, step=epoch)
         tb.flush()
 
-        print(
+        print0(
             f"  Policy Loss: {avg_pl:.4f} | Value Loss: {avg_vl:.4f} | "
             f"Avg Reward: {avg_rw:.4f} | "
             f"Val HitRate@L1: {val_metrics['hitrate_l1']:.4f}"
@@ -629,11 +790,14 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(),
-                       os.path.join(cfg.train.save_dir, "hepo_best.pt"))
-            print("  -> Saved best HEPO model")
+            save_checkpoint(
+                model,
+                os.path.join(cfg.train.save_dir, "hepo_best.pt"),
+                is_fsdp=is_fsdp,
+            )
+            print0("  -> Saved best HEPO model")
 
-    print(f"HEPO training complete. Best val loss: {best_val_loss:.4f}")
+    print0(f"HEPO training complete. Best val loss: {best_val_loss:.4f}")
     return model
 
 
@@ -642,8 +806,8 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_model(model, val_loader, cfg, mode="mtp"):
-    device = cfg.train.device
+def evaluate_model(model, val_loader, cfg, mode="mtp", is_fsdp=False):
+    device = torch.device("cuda", local_rank())
     dtype = get_dtype(cfg.train.dtype)
     model.eval()
 
@@ -677,6 +841,14 @@ def evaluate_model(model, val_loader, cfg, mode="mtp"):
         total_full_hits += (pred_codes == target).all(dim=1).sum().item()
         total_samples += B
 
+    if is_dist():
+        stats = torch.tensor(
+            [total_loss, total_l1_hits, total_full_hits, total_samples],
+            device=device, dtype=torch.float64,
+        )
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        total_loss, total_l1_hits, total_full_hits, total_samples = stats.tolist()
+
     avg_loss = total_loss / max(total_samples, 1)
     l1_hitrate = total_l1_hits / max(total_samples, 1)
     full_hitrate = total_full_hits / max(total_samples, 1)
@@ -689,34 +861,28 @@ def evaluate_model(model, val_loader, cfg, mode="mtp"):
 
 
 # ---------------------------------------------------------------------------
-# Data preparation
+# Data preparation (runs on all ranks, but downloads on rank 0 only)
 # ---------------------------------------------------------------------------
 
-def prepare_data(cfg):
-    """Load/generate data, train tokenizer, create dataloaders.
-
-    Returns (train_loader, val_loader, extra_data) where extra_data
-    contains the semantic trie, popularity maps, and item mappings
-    needed by HEPO training.
-    """
-    print("Preparing data...")
+def prepare_data(cfg, is_distributed=False):
+    print0("Preparing data...")
 
     if cfg.data.dataset == "synthetic":
-        print("Using synthetic dataset")
+        print0("Using synthetic dataset")
         df, item_meta, item_embeddings, _ = generate_synthetic_data(cfg.data)
     else:
-        print(f"Loading Amazon {cfg.data.amazon_category} reviews...")
+        print0(f"Loading Amazon {cfg.data.amazon_category} reviews...")
         try:
             df, item_meta = load_amazon_reviews(cfg.data)
-            print(f"  Loaded {len(df)} interactions, {df['item'].nunique()} items")
+            print0(f"  Loaded {len(df)} interactions, {df['item'].nunique()} items")
             n_items = df["item"].nunique()
             item_embeddings = np.random.randn(n_items, cfg.data.item_embed_dim).astype(
                 np.float32
             )
             item_embeddings /= np.linalg.norm(item_embeddings, axis=1, keepdims=True)
         except Exception as e:
-            print(f"  Failed to load Amazon data: {e}")
-            print("  Falling back to synthetic dataset")
+            print0(f"  Failed to load Amazon data: {e}")
+            print0("  Falling back to synthetic dataset")
             cfg.data.dataset = "synthetic"
             df, item_meta, item_embeddings, _ = generate_synthetic_data(cfg.data)
 
@@ -725,7 +891,7 @@ def prepare_data(cfg):
 
     cfg.model.n_items = len(unique_items)
     cfg.model.n_users = df["user"].nunique()
-    print(f"  {cfg.model.n_users} users, {cfg.model.n_items} items")
+    print0(f"  {cfg.model.n_users} users, {cfg.model.n_items} items")
 
     if len(item_embeddings) < len(unique_items):
         extra = np.random.randn(
@@ -741,12 +907,15 @@ def prepare_data(cfg):
     tokenizer = RQKMeansPlus(cfg.tokenizer).to(cfg.train.device)
 
     if os.path.exists(tokenizer_path):
-        print("Loading existing tokenizer...")
+        print0("Loading existing tokenizer...")
         tokenizer.load(tokenizer_path)
     else:
-        print("Training RQ-KMeans+ tokenizer...")
+        print0("Training RQ-KMeans+ tokenizer...")
         tokenizer.fit(item_embeddings, cfg.tokenizer)
-        tokenizer.save(tokenizer_path)
+        if is_main():
+            tokenizer.save(tokenizer_path)
+        if is_distributed:
+            dist.barrier()
 
     all_semantic_ids = tokenizer.encode_all(item_embeddings)
     item2sid = {
@@ -756,15 +925,16 @@ def prepare_data(cfg):
     }
 
     user_seqs = build_sequences(df, item_meta, cfg.data)
-    print(f"  Built {len(user_seqs)} user sequences")
+    print0(f"  Built {len(user_seqs)} user sequences")
 
-    train_loader, val_loader = create_dataloaders(user_seqs, item2sid, cfg)
-    print(
+    train_loader, val_loader = create_dataloaders_distributed(
+        user_seqs, item2sid, cfg, is_distributed
+    )
+    print0(
         f"  Train: {len(train_loader.dataset)} samples, "
         f"Val: {len(val_loader.dataset)} samples"
     )
 
-    # Build extra data structures for HEPO
     trie = SemanticTrie.build_from_items(item2sid)
     all_codes_per_level = get_all_codes_per_level(
         item2sid, cfg.model.n_semantic_levels
@@ -784,43 +954,85 @@ def prepare_data(cfg):
     return train_loader, val_loader, extra_data
 
 
+def create_dataloaders_distributed(user_seqs, item2sid, cfg, is_distributed):
+    """Create DataLoaders with DistributedSampler when running multi-GPU."""
+    from data_utils import GPRDataset
+
+    random.shuffle(user_seqs)
+    split = int(len(user_seqs) * 0.9)
+    train_seqs = user_seqs[:split]
+    val_seqs = user_seqs[split:]
+
+    train_ds = GPRDataset(
+        train_seqs, item2sid,
+        n_levels=cfg.model.n_semantic_levels,
+        max_seq_len=cfg.data.max_seq_len,
+        n_organic=cfg.data.n_organic_per_sample,
+        d_user=cfg.model.d_user,
+        d_env=cfg.model.d_env,
+        is_train=True,
+    )
+    val_ds = GPRDataset(
+        val_seqs, item2sid,
+        n_levels=cfg.model.n_semantic_levels,
+        max_seq_len=cfg.data.max_seq_len,
+        n_organic=cfg.data.n_organic_per_sample,
+        d_user=cfg.model.d_user,
+        d_env=cfg.model.d_env,
+        is_train=False,
+    )
+
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if is_distributed else None
+    val_sampler = DistributedSampler(val_ds, shuffle=False) if is_distributed else None
+
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg.train.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=cfg.train.num_workers,
+        pin_memory=True, drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=cfg.train.batch_size,
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=cfg.train.num_workers,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="GPR Training Pipeline")
+    parser = argparse.ArgumentParser(description="GPR Training Pipeline (FSDP)")
     parser.add_argument("--dataset", type=str, default="synthetic",
-                        choices=["synthetic", "amazon"],
-                        help="Dataset to use (auto-downloaded if amazon)")
+                        choices=["synthetic", "amazon"])
     parser.add_argument("--stage", type=str, default="all",
-                        choices=["all", "mtp", "vaft", "hepo"],
-                        help="Training stage(s) to run")
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Path to checkpoint to resume from")
-    parser.add_argument("--device", type=str, default=None,
-                        help="Device override (cuda/cpu)")
+                        choices=["all", "mtp", "vaft", "hepo"])
+    parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--mtp_epochs", type=int, default=None)
     parser.add_argument("--vaft_epochs", type=int, default=None)
     parser.add_argument("--hepo_epochs", type=int, default=None)
-    parser.add_argument("--log_dir", type=str, default="runs",
-                        help="TensorBoard log directory")
-    parser.add_argument("--run_name", type=str, default=None,
-                        help="Custom run name for TensorBoard")
-    parser.add_argument("--hf_token", type=str, default=None,
-                        help="HuggingFace token for authenticated dataset downloads")
+    parser.add_argument("--log_dir", type=str, default="runs")
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--hf_token", type=str, default=None)
+    parser.add_argument("--no_fsdp", action="store_true",
+                        help="Disable FSDP (single-GPU mode)")
     args = parser.parse_args()
 
-    # Propagate HF token to environment so data_utils picks it up
     if args.hf_token:
         os.environ["HF_TOKEN"] = args.hf_token
 
-    # --- Config ---
+    is_distributed = setup_distributed()
+    use_fsdp = is_distributed and not args.no_fsdp
+
     cfg = GPRConfig()
     cfg.data.dataset = args.dataset
-    if args.device:
-        cfg.train.device = args.device
     if args.batch_size:
         cfg.train.batch_size = args.batch_size
     if args.mtp_epochs:
@@ -831,95 +1043,114 @@ def main():
         cfg.train.hepo_epochs = args.hepo_epochs
     cfg = cfg.sync()
 
-    set_seed(cfg.train.seed)
+    set_seed(cfg.train.seed + rank())
 
-    # --- TensorBoard setup ---
     run_name = args.run_name or (
-        f"gpr_cuda_{args.dataset}_{args.stage}_"
+        f"gpr_fsdp{world_size()}_{args.dataset}_{args.stage}_"
         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
     tb_log_dir = os.path.join(args.log_dir, run_name)
-    os.makedirs(tb_log_dir, exist_ok=True)
+    if is_main():
+        os.makedirs(tb_log_dir, exist_ok=True)
     tb = TBLogger(tb_log_dir)
 
-    config_path = os.path.join(tb_log_dir, "config.json")
-    with open(config_path, "w") as f:
-        json.dump({
-            "dataset": cfg.data.dataset,
-            "stage": args.stage,
-            "batch_size": cfg.train.batch_size,
-            "d_model": cfg.model.d_model,
-            "n_heads": cfg.model.n_heads,
-            "n_layers_hsd": cfg.model.n_layers_hsd,
-            "n_layers_ptd": cfg.model.n_layers_ptd,
-            "n_semantic_levels": cfg.model.n_semantic_levels,
-            "codebook_size": cfg.model.codebook_size,
-            "n_mtp_heads": cfg.model.n_mtp_heads,
-            "mtp_epochs": cfg.train.mtp_epochs,
-            "mtp_lr": cfg.train.mtp_lr,
-            "vaft_epochs": cfg.train.vaft_epochs,
-            "vaft_lr": cfg.train.vaft_lr,
-            "hepo_epochs": cfg.train.hepo_epochs,
-            "hepo_lr_policy": cfg.train.hepo_lr_policy,
-            "hepo_lam": cfg.train.lam,
-            "arr_enabled": cfg.train.arr_enabled,
-        }, f, indent=2)
+    if is_main():
+        config_path = os.path.join(tb_log_dir, "config.json")
+        with open(config_path, "w") as f:
+            json.dump({
+                "dataset": cfg.data.dataset,
+                "stage": args.stage,
+                "world_size": world_size(),
+                "use_fsdp": use_fsdp,
+                "batch_size_per_gpu": cfg.train.batch_size,
+                "effective_batch_size": cfg.train.batch_size * world_size(),
+                "d_model": cfg.model.d_model,
+                "n_heads": cfg.model.n_heads,
+                "d_ff": cfg.model.d_ff,
+                "n_layers_hsd": cfg.model.n_layers_hsd,
+                "n_layers_ptd": cfg.model.n_layers_ptd,
+                "n_semantic_levels": cfg.model.n_semantic_levels,
+                "codebook_size": cfg.model.codebook_size,
+                "max_seq_len": cfg.model.max_seq_len,
+                "n_mtp_heads": cfg.model.n_mtp_heads,
+                "mtp_epochs": cfg.train.mtp_epochs,
+                "mtp_lr": cfg.train.mtp_lr,
+                "vaft_epochs": cfg.train.vaft_epochs,
+                "vaft_lr": cfg.train.vaft_lr,
+                "hepo_epochs": cfg.train.hepo_epochs,
+                "activation_checkpointing": cfg.train.activation_checkpointing,
+            }, f, indent=2)
 
-    print(f"Device: {cfg.train.device}")
-    print(f"Dtype: {cfg.train.dtype}")
-    print(f"Dataset: {cfg.data.dataset}")
-    print(f"TensorBoard: {tb_log_dir}")
-    print(f"  -> Launch:  tensorboard --logdir {args.log_dir} --port 6006")
+    print0(f"World size: {world_size()}")
+    print0(f"FSDP: {use_fsdp}")
+    print0(f"Device: cuda:{local_rank()}")
+    print0(f"Dtype: {cfg.train.dtype}")
+    print0(f"Model: d={cfg.model.d_model}, HSD layers={cfg.model.n_layers_hsd}, "
+           f"PTD layers={cfg.model.n_layers_ptd}")
+    print0(f"Batch size per GPU: {cfg.train.batch_size}, "
+           f"Effective: {cfg.train.batch_size * world_size()}")
+    print0(f"Dataset: {cfg.data.dataset}")
+    print0(f"TensorBoard: {tb_log_dir}")
 
-    # --- Data ---
-    train_loader, val_loader, extra_data = prepare_data(cfg)
+    train_loader, val_loader, extra_data = prepare_data(cfg, is_distributed)
 
-    # --- Model ---
     model = GPR(cfg.model)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {n_params:,} ({n_params / 1e6:.1f}M)")
+    print0(f"Model parameters: {n_params:,} ({n_params / 1e6:.1f}M)")
 
     tb.log_scalar("model/n_params_M", n_params / 1e6, step=0)
     tb.log_scalar("model/n_layers_hsd", cfg.model.n_layers_hsd, step=0)
     tb.log_scalar("model/d_model", cfg.model.d_model, step=0)
 
-    if args.resume:
-        print(f"Loading checkpoint: {args.resume}")
-        model.load_state_dict(torch.load(args.resume, weights_only=True))
+    if use_fsdp:
+        model = wrap_model_fsdp(model, cfg)
+        print0("Model wrapped with FSDP")
+        if cfg.train.activation_checkpointing:
+            print0("Activation checkpointing enabled for HSDBlock")
+    else:
+        device = torch.device("cuda", local_rank())
+        dtype = get_dtype(cfg.train.dtype)
+        model = model.to(device=device, dtype=dtype)
 
-    # --- Training ---
+    if args.resume:
+        print0(f"Loading checkpoint: {args.resume}")
+        load_checkpoint(model, args.resume, is_fsdp=use_fsdp)
+
     t0 = time.time()
 
     if args.stage in ("all", "mtp"):
-        model = train_mtp(model, train_loader, val_loader, cfg, tb)
+        model = train_mtp(model, train_loader, val_loader, cfg, tb,
+                          is_fsdp=use_fsdp)
 
     if args.stage in ("all", "vaft"):
         if args.stage == "vaft" and args.resume is None:
             mtp_path = os.path.join(cfg.train.save_dir, "mtp_best.pt")
             if os.path.exists(mtp_path):
-                print(f"Loading MTP checkpoint: {mtp_path}")
-                model.load_state_dict(torch.load(mtp_path, weights_only=True))
-        model = train_vaft(model, train_loader, val_loader, cfg, tb)
+                print0(f"Loading MTP checkpoint: {mtp_path}")
+                load_checkpoint(model, mtp_path, is_fsdp=use_fsdp)
+        model = train_vaft(model, train_loader, val_loader, cfg, tb,
+                           is_fsdp=use_fsdp)
 
     if args.stage in ("all", "hepo"):
         if args.stage == "hepo" and args.resume is None:
             vaft_path = os.path.join(cfg.train.save_dir, "vaft_best.pt")
             if os.path.exists(vaft_path):
-                print(f"Loading VAFT checkpoint: {vaft_path}")
-                model.load_state_dict(torch.load(vaft_path, weights_only=True))
+                print0(f"Loading VAFT checkpoint: {vaft_path}")
+                load_checkpoint(model, vaft_path, is_fsdp=use_fsdp)
         model = train_hepo(model, train_loader, val_loader, cfg, tb,
-                           extra_data=extra_data)
+                           extra_data=extra_data, is_fsdp=use_fsdp)
 
     elapsed = time.time() - t0
     tb.log_scalar("timing/total_minutes", elapsed / 60, step=0)
     tb.close()
 
     final_path = os.path.join(cfg.train.save_dir, "gpr_final.pt")
-    torch.save(model.state_dict(), final_path)
-    print(f"\nTotal training time: {elapsed / 60:.1f} minutes")
-    print(f"Final model saved to {final_path}")
-    print(f"TensorBoard logs at: {tb_log_dir}")
-    print(f"  -> Run:  tensorboard --logdir {args.log_dir} --port 6006")
+    save_checkpoint(model, final_path, is_fsdp=use_fsdp)
+    print0(f"\nTotal training time: {elapsed / 60:.1f} minutes")
+    print0(f"Final model saved to {final_path}")
+    print0(f"TensorBoard logs at: {tb_log_dir}")
+
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
